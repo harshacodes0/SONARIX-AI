@@ -1,0 +1,882 @@
+clc;
+clear;
+close all;
+
+disp('==============================================================');
+disp('              SONARIX AI - INFERENCE');
+disp('     Corrected Speech Preservation + Noise Reduction');
+disp('==============================================================');
+
+%% ==============================================================
+% 1. FIND PROJECT ROOT
+% ==============================================================
+
+scriptPath = mfilename('fullpath');
+srcFolder = fileparts(scriptPath);
+
+if contains(srcFolder, 'src')
+    projectRoot = fileparts(srcFolder);
+else
+    projectRoot = srcFolder;
+end
+
+modelFolder = fullfile(projectRoot, 'models');
+resultsFolder = fullfile(projectRoot, 'results');
+
+if ~exist(resultsFolder, 'dir')
+    mkdir(resultsFolder);
+end
+
+
+%% ==============================================================
+% 2. LOAD TRAINED MODEL
+% ==============================================================
+
+modelFile = fullfile(modelFolder, 'sonarix_ai_mask_network.mat');
+
+if ~exist(modelFile, 'file')
+    error('Trained SONARIX model not found:\n%s', modelFile);
+end
+
+fprintf('\nLoading SONARIX AI model...\n');
+
+modelData = load(modelFile);
+
+if isfield(modelData, 'net')
+    sonarixNet = modelData.net;
+
+elseif isfield(modelData, 'sonarixNet')
+    sonarixNet = modelData.sonarixNet;
+
+else
+    error('No trained neural network found in model file.');
+end
+
+fprintf('Model loaded successfully.\n');
+
+
+%% ==============================================================
+% 3. AUDIO SETTINGS
+% ==============================================================
+
+Fs = 44100;
+
+frameLength = 1411;
+hopLength   = 706;
+nfft        = 2048;
+
+window = hann(frameLength, 'periodic');
+
+
+%% ==============================================================
+% 4. DETERMINE NETWORK INPUT SIZE
+% ==============================================================
+
+networkInputSize = sonarixNet.Layers(1).InputSize;
+
+if numel(networkInputSize) == 2
+    expectedFeatures = networkInputSize(2);
+else
+    expectedFeatures = networkInputSize(end);
+end
+
+fprintf('\nNetwork expected features: %d\n', expectedFeatures);
+
+
+%% ==============================================================
+% 5. SELECT NOISY AUDIO
+% ==============================================================
+
+[fileName, filePath] = uigetfile( ...
+    {'*.wav', 'WAV Audio Files (*.wav)'}, ...
+    'Select Noisy Audio File');
+
+if isequal(fileName, 0)
+    disp('No audio selected.');
+    return;
+end
+
+inputFile = fullfile(filePath, fileName);
+
+fprintf('\nInput audio:\n%s\n', inputFile);
+
+
+%% ==============================================================
+% 6. LOAD AUDIO
+% ==============================================================
+
+[x, inputFs] = audioread(inputFile);
+
+% Convert stereo to mono
+if size(x, 2) > 1
+    x = mean(x, 2);
+end
+
+x = double(x);
+
+fprintf('Original sample rate: %d Hz\n', inputFs);
+fprintf('Original duration: %.2f seconds\n', length(x)/inputFs);
+
+
+%% ==============================================================
+% 7. RESAMPLE
+% ==============================================================
+
+if inputFs ~= Fs
+
+    fprintf('Resampling to %d Hz...\n', Fs);
+
+    x = resample(x, Fs, inputFs);
+
+end
+
+
+%% ==============================================================
+% 8. REMOVE DC OFFSET
+% ==============================================================
+
+x = x - mean(x);
+
+
+%% ==============================================================
+% 9. NORMALIZE INPUT FOR AI
+% ==============================================================
+
+inputPeak = max(abs(x));
+
+if inputPeak > 0
+
+    xAI = x / inputPeak;
+
+else
+
+    error('Input audio is silent.');
+
+end
+
+%% ==============================================================
+% 10. CREATE STFT
+% ==============================================================
+
+fprintf('\nCreating STFT...\n');
+
+% Store original length
+originalLength = length(xAI);
+
+% Pad audio so the final part is not lost
+numSamples = length(xAI);
+
+numFrames = ceil((numSamples - frameLength) / hopLength) + 1;
+
+% Calculate required padded length
+requiredLength = (numFrames - 1) * hopLength + frameLength;
+
+paddingLength = requiredLength - numSamples;
+
+if paddingLength > 0
+    xAI = [xAI; zeros(paddingLength,1)];
+end
+
+featureSpectrum = zeros(nfft, numFrames);
+
+for k = 1:numFrames
+
+    startIndex = (k-1)*hopLength + 1;
+    stopIndex = startIndex + frameLength - 1;
+
+    frame = xAI(startIndex:stopIndex);
+
+    frame = frame .* window;
+
+    spectrum = fft(frame, nfft);
+
+    featureSpectrum(:, k) = spectrum;
+
+end
+
+fprintf('STFT frames: %d\n', numFrames);
+fprintf('Frequency bins: %d\n', nfft);
+
+
+if numFrames < 1
+    error('Audio is too short for STFT processing.');
+end
+
+featureSpectrum = zeros(nfft, numFrames);
+
+for k = 1:numFrames
+
+    startIndex = (k-1)*hopLength + 1;
+
+    stopIndex = startIndex + frameLength - 1;
+
+    frame = xAI(startIndex:stopIndex);
+
+    frame = frame .* window;
+
+    spectrum = fft(frame, nfft);
+
+    featureSpectrum(:, k) = spectrum;
+
+end
+
+fprintf('STFT frames: %d\n', numFrames);
+fprintf('Frequency bins: %d\n', nfft);
+
+
+%% ==============================================================
+% 11. CREATE AI FEATURES
+% ==============================================================
+
+featureMagnitude = abs(featureSpectrum);
+
+features = log1p(featureMagnitude);
+
+% Network expects Frames × Features
+features = features';
+
+
+%% ==============================================================
+% 12. MATCH NETWORK INPUT SIZE
+% ==============================================================
+
+if size(features,2) ~= expectedFeatures
+
+    fprintf('\nAdjusting feature dimensions...\n');
+
+    if expectedFeatures == nfft
+
+        features = features(:, 1:nfft);
+
+    elseif expectedFeatures == floor(nfft/2)+1
+
+        features = features(:, 1:floor(nfft/2)+1);
+
+    else
+
+        error(['Network expects %d features, but audio preprocessing ' ...
+               'produced %d features.'], ...
+               expectedFeatures, size(features,2));
+
+    end
+
+end
+
+fprintf('AI input size: %d x %d\n', ...
+    size(features,1), size(features,2));
+
+
+%% ==============================================================
+% 13. AI PREDICTION
+% ==============================================================
+
+fprintf('\nRunning SONARIX AI...\n');
+
+predictedMask = predict(sonarixNet, features);
+
+predictedMask = double(predictedMask);
+
+fprintf('Prediction size: %d x %d\n', ...
+    size(predictedMask,1), size(predictedMask,2));
+
+
+%% ==============================================================
+% 14. CORRECT MASK ORIENTATION
+% ==============================================================
+
+if size(predictedMask,1) == numFrames
+
+    predictedMask = predictedMask';
+
+elseif size(predictedMask,2) == numFrames
+
+    % Already frequency × time
+
+else
+
+    error('Unexpected neural network output dimensions.');
+
+end
+
+
+%% ==============================================================
+% 15. MATCH FREQUENCY DIMENSION
+% ==============================================================
+
+if size(predictedMask,1) ~= nfft
+
+    if size(predictedMask,1) == floor(nfft/2)+1
+
+        % Convert one-sided mask to full FFT mask
+
+        oneSideMask = predictedMask;
+
+        predictedMask = zeros(nfft, numFrames);
+
+        predictedMask(1:floor(nfft/2)+1,:) = oneSideMask;
+
+        predictedMask(floor(nfft/2)+2:end,:) = ...
+            flipud(oneSideMask(2:floor(nfft/2),:));
+
+    else
+
+        error('AI output frequency dimension does not match STFT.');
+
+    end
+
+end
+
+
+%% ==============================================================
+% 16. CLAMP AI MASK
+% ==============================================================
+
+predictedMask = max(0, min(1, predictedMask));
+
+fprintf('\nAI mask statistics:\n');
+
+fprintf('Minimum : %.4f\n', min(predictedMask(:)));
+fprintf('Maximum : %.4f\n', max(predictedMask(:)));
+fprintf('Mean    : %.4f\n', mean(predictedMask(:)));
+
+
+%% ==============================================================
+% 17. TEMPORAL SMOOTHING
+% ==============================================================
+
+fprintf('\nApplying temporal smoothing...\n');
+
+smoothAlpha = 0.80;
+
+speechMask = predictedMask;
+
+for k = 2:numFrames
+
+    speechMask(:,k) = ...
+        smoothAlpha * speechMask(:,k-1) + ...
+        (1-smoothAlpha) * speechMask(:,k);
+
+end
+
+
+%% ==============================================================
+% 18. CORRECT FULL FFT FREQUENCY AXIS
+% ==============================================================
+
+% Standard FFT frequency bins
+frequencyAxis = (0:nfft-1)' * Fs / nfft;
+
+% Convert upper FFT half into negative frequencies
+negativeIndices = frequencyAxis > Fs/2;
+
+frequencyAxis(negativeIndices) = ...
+    frequencyAxis(negativeIndices) - Fs;
+
+% Absolute frequency for symmetric processing
+absFrequency = abs(frequencyAxis);
+
+%% ==============================================================
+% 19. IMPROVED SPEECH PROTECTION
+% ==============================================================
+
+% Main human voice energy region
+voiceCoreBand = ...
+    (absFrequency >= 300) & ...
+    (absFrequency <= 4000);
+
+% Extended speech frequencies
+voiceExtendedBand = ...
+    (absFrequency >= 150) & ...
+    (absFrequency <= 7000);
+
+% Strong protection for core voice frequencies
+speechMask(voiceCoreBand,:) = ...
+    max(speechMask(voiceCoreBand,:), 0.88);
+
+% Moderate protection for extended speech frequencies
+speechMask(voiceExtendedBand,:) = ...
+    max(speechMask(voiceExtendedBand,:), 0.70);
+
+
+%% ==============================================================
+% 20. BACKGROUND REDUCTION
+% ==============================================================
+
+% Very low frequency rumble
+lowBand = absFrequency < 60;
+
+% Very high frequency noise/hiss
+highBand = absFrequency > 10000;
+
+speechMask(lowBand,:) = ...
+    speechMask(lowBand,:) * 0.50;
+
+speechMask(highBand,:) = ...
+    speechMask(highBand,:) * 0.60;
+
+
+%% ==============================================================
+% 21. SOFT AI CONTROL
+% ==============================================================
+
+% Controls how strongly AI mask modifies original spectrum
+
+aiStrength = 0.30;
+
+safeMask = ...
+    (1 - aiStrength) + ...
+    aiStrength .* speechMask;
+
+fprintf('\nAI control:\n');
+
+fprintf('AI strength: %.2f (%.0f%%)\n', ...
+    aiStrength, aiStrength*100);
+
+fprintf('Safe mask minimum: %.4f\n', ...
+    min(safeMask(:)));
+
+fprintf('Safe mask maximum: %.4f\n', ...
+    max(safeMask(:)));
+
+
+%% ==============================================================
+% 22. APPLY AI MASK
+% ==============================================================
+
+enhancedSpectrum = ...
+    featureSpectrum .* safeMask;
+
+
+%% ==============================================================
+% 23. EXTRA DSP NOISE SUPPRESSION
+% ==============================================================
+
+dspMask = ones(nfft,1);
+
+% Symmetric low-frequency suppression
+dspMask(absFrequency < 60) = 0.50;
+
+% Symmetric high-frequency suppression
+dspMask(absFrequency > 10000) = 0.65;
+
+enhancedSpectrum = ...
+    enhancedSpectrum .* dspMask;
+
+
+%% ==============================================================
+% 24. RECONSTRUCT AUDIO
+% ==============================================================
+
+fprintf('\nReconstructing enhanced audio...\n');
+
+enhanced = localISTFT( ...
+    enhancedSpectrum, ...
+    frameLength, ...
+    hopLength, ...
+    nfft, ...
+    window);
+
+fprintf('\nReconstruction check:\n');
+
+fprintf('Minimum : %.10f\n', min(enhanced));
+fprintf('Maximum : %.10f\n', max(enhanced));
+fprintf('RMS     : %.10f\n', sqrt(mean(enhanced.^2)));
+
+if max(abs(enhanced)) < 1e-6
+    warning('SONARIX reconstruction is nearly silent!');
+end
+
+
+%% ==============================================================
+% 25. MODERATE SPEECH BOOST
+% ==============================================================
+
+voiceBoost = 1.5;
+
+enhanced = enhanced * voiceBoost;
+
+
+%% ==============================================================
+% 26. SPEECH BAND FILTER
+% ==============================================================
+
+[b,a] = butter(4, [80 8000] / (Fs/2), 'bandpass');
+
+speechComponent = filtfilt(b, a, enhanced);
+
+
+%% ==============================================================
+% 27. MIX ORIGINAL + ENHANCED SPEECH
+% ==============================================================
+
+% Preserve some original speech information
+
+minLength = min(length(xAI), length(speechComponent));
+
+xAI = xAI(1:minLength);
+
+speechComponent = speechComponent(1:minLength);
+
+originalMix = 0.15;
+
+enhancedMix = 0.85;
+
+finalAudio = ...
+    originalMix * xAI + ...
+    enhancedMix * speechComponent;
+
+
+%% ==============================================================
+% 28. REMOVE DC OFFSET BEFORE LOUDNESS CONTROL
+% ==============================================================
+
+finalAudio = finalAudio - mean(finalAudio);
+
+
+%% ==============================================================
+% 29. FINAL RMS LOUDNESS NORMALIZATION
+% ==============================================================
+
+originalRMS = sqrt(mean(xAI.^2));
+
+currentRMS = sqrt(mean(finalAudio.^2));
+
+fprintf('\n================ LOUDNESS CONTROL ================\n');
+
+fprintf('Original RMS : %.6f\n', originalRMS);
+fprintf('Current RMS  : %.6f\n', currentRMS);
+
+% Target output loudness
+targetRMS = originalRMS * 0.80;
+
+if currentRMS > 1e-8
+
+    gain = targetRMS / currentRMS;
+
+    % Maximum allowed gain
+    gain = min(gain, 12);
+
+    fprintf('Target RMS   : %.6f\n', targetRMS);
+fprintf('Applied gain : %.3fx\n', gain);
+
+    finalAudio = finalAudio * gain;
+
+else
+
+    warning('Output RMS too small for normalization.');
+
+end
+
+
+%% ==============================================================
+% 30. SOFT LIMITER
+% ==============================================================
+
+% Unlike hard peak normalization, this compresses only peaks
+
+threshold = 0.90;
+
+peakBeforeLimiter = max(abs(finalAudio));
+
+fprintf('\nPeak before limiter: %.4f\n', peakBeforeLimiter);
+
+if peakBeforeLimiter > threshold
+
+    % Soft saturation
+    finalAudio = threshold * tanh(finalAudio / threshold);
+
+    fprintf('Soft limiter applied.\n');
+
+end
+
+
+%% ==============================================================
+% 31. FINAL SAFETY LIMIT
+% ==============================================================
+
+finalAudio = max(min(finalAudio, 0.99), -0.99);
+
+
+%% ==============================================================
+% 32. FINAL AUDIO ANALYSIS
+% ==============================================================
+
+finalPeak = max(abs(finalAudio));
+
+finalRMS = sqrt(mean(finalAudio.^2));
+
+fprintf('\n================ FINAL AUDIO ================\n');
+
+fprintf('Peak: %.4f\n', finalPeak);
+fprintf('RMS : %.6f\n', finalRMS);
+
+fprintf('================================================\n');
+
+if finalRMS < 1e-5
+    warning('Final SONARIX audio is extremely quiet.');
+end
+
+
+%% ==============================================================
+% 33. SAVE OUTPUT
+% ==============================================================
+
+[~, baseName, ~] = fileparts(fileName);
+
+outputFile = fullfile( ...
+    resultsFolder, ...
+    [baseName '_SONARIX_ENHANCED.wav']);
+
+audiowrite( ...
+    outputFile, ...
+    finalAudio, ...
+    Fs);
+
+fprintf('\n==============================================================');
+fprintf('\n              SONARIX AI COMPLETE');
+fprintf('\n==============================================================\n');
+
+fprintf('\nEnhanced audio saved to:\n%s\n', outputFile);
+
+
+
+%% ==============================================================
+% 34. SAVE WAVEFORM COMPARISON AS PNG
+% ==============================================================
+
+f1 = figure('Visible', 'off');
+
+set(f1, 'Position', [100 100 1000 700]);
+
+
+% ORIGINAL WAVEFORM
+subplot(2,1,1);
+
+plot((0:length(xAI)-1)/Fs, xAI);
+
+title('Original Noisy Audio Waveform');
+
+xlabel('Time (seconds)');
+ylabel('Amplitude');
+
+grid on;
+
+
+% ENHANCED WAVEFORM
+subplot(2,1,2);
+
+plot((0:length(finalAudio)-1)/Fs, finalAudio);
+
+title('SONARIX AI Enhanced Audio Waveform');
+
+xlabel('Time (seconds)');
+ylabel('Amplitude');
+
+grid on;
+
+
+% SAVE WAVEFORM
+waveformFile = fullfile( ...
+    resultsFolder, ...
+    [baseName '_WAVEFORM_COMPARISON.png']);
+
+exportgraphics(f1, waveformFile, 'Resolution', 150);
+
+close(f1);
+
+fprintf('\nWaveform comparison saved to:\n%s\n', waveformFile);
+
+
+%% ==============================================================
+% 35. SAVE SPECTROGRAM COMPARISON AS PNG
+% ==============================================================
+
+f2 = figure('Visible', 'off');
+
+set(f2, 'Position', [100 100 1000 700]);
+
+
+% ORIGINAL AUDIO SPECTROGRAM
+subplot(2,1,1);
+
+[S1, F1, T1] = spectrogram( ...
+    xAI, ...
+    window, ...
+    frameLength-hopLength, ...
+    nfft, ...
+    Fs);
+
+imagesc(T1, F1/1000, 20*log10(abs(S1)+1e-6));
+
+axis xy;
+
+ylim([0 10]);
+
+xlabel('Time (seconds)');
+ylabel('Frequency (kHz)');
+
+title('Original Noisy Audio Spectrogram');
+
+colorbar;
+
+
+% ENHANCED AUDIO SPECTROGRAM
+subplot(2,1,2);
+
+[S2, F2, T2] = spectrogram( ...
+    finalAudio, ...
+    window, ...
+    frameLength-hopLength, ...
+    nfft, ...
+    Fs);
+
+imagesc(T2, F2/1000, 20*log10(abs(S2)+1e-6));
+
+axis xy;
+
+ylim([0 10]);
+
+xlabel('Time (seconds)');
+ylabel('Frequency (kHz)');
+
+title('SONARIX AI Enhanced Audio Spectrogram');
+
+colorbar;
+
+
+% SAVE SPECTROGRAM
+spectrogramFile = fullfile( ...
+    resultsFolder, ...
+    [baseName '_SPECTROGRAM_COMPARISON.png']);
+
+exportgraphics(f2, spectrogramFile, 'Resolution', 150);
+
+close(f2);
+
+fprintf('\nSpectrogram comparison saved to:\n%s\n', ...
+    spectrogramFile);
+
+
+%% ==============================================================
+% 36. FINAL COMPLETION MESSAGE
+% ==============================================================
+
+disp(' ');
+disp('==============================================================');
+disp('      SONARIX RESULTS GENERATED SUCCESSFULLY');
+disp('==============================================================');
+
+disp(' ');
+disp('Results saved in the results folder:');
+disp('1. Enhanced Audio (.wav)');
+disp('2. Waveform Comparison (.png)');
+disp('3. Spectrogram Comparison (.png)');
+disp(' ');
+
+%% ==============================================================
+% 37. BEFORE AND AFTER AUDIO PLAYBACK
+% ==============================================================
+
+disp(' ');
+disp('==============================================================');
+disp('              BEFORE AND AFTER AUDIO PREVIEW');
+disp('==============================================================');
+
+try
+
+    % ---------------- BEFORE ----------------
+    fprintf('\nPlaying BEFORE: Original Noisy Audio...\n');
+
+    playerBefore = audioplayer(xAI, Fs);
+
+    play(playerBefore);
+
+    % Wait until original audio finishes
+    while isplaying(playerBefore)
+        pause(0.1);
+    end
+
+    pause(1);
+
+
+    % ---------------- AFTER ----------------
+    fprintf('\nPlaying AFTER: SONARIX Enhanced Audio...\n');
+
+    playerAfter = audioplayer(finalAudio, Fs);
+
+    play(playerAfter);
+
+    % Wait until enhanced audio finishes
+    while isplaying(playerAfter)
+        pause(0.1);
+    end
+
+
+    fprintf('\nBefore and After playback completed.\n');
+
+catch ME
+
+    warning('Audio playback failed: %s', ME.message);
+
+    fprintf('\nPlease play the WAV files manually.\n');
+
+end
+
+%% ==============================================================
+% LOCAL ISTFT FUNCTION
+% ==============================================================
+
+function output = localISTFT( ...
+    spectrum, ...
+    frameLength, ...
+    hopLength, ...
+    nfft, ...
+    window)
+
+    [~, numFrames] = size(spectrum);
+
+    outputLength = ...
+        (numFrames-1)*hopLength + frameLength;
+
+    output = zeros(outputLength,1);
+
+    windowSum = zeros(outputLength,1);
+
+
+    for k = 1:numFrames
+
+        startIndex = ...
+            (k-1)*hopLength + 1;
+
+        stopIndex = ...
+            startIndex + frameLength - 1;
+
+        frameSpectrum = spectrum(:,k);
+
+        frame = real(ifft( ...
+            frameSpectrum, ...
+            nfft));
+
+        frame = frame(1:frameLength);
+
+        frame = frame .* window;
+
+
+        output(startIndex:stopIndex) = ...
+            output(startIndex:stopIndex) + frame;
+
+
+        windowSum(startIndex:stopIndex) = ...
+            windowSum(startIndex:stopIndex) + window.^2;
+
+    end
+
+
+    valid = windowSum > 1e-8;
+
+
+    output(valid) = ...
+        output(valid) ./ windowSum(valid);
+
+end
+
